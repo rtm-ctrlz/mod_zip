@@ -6,17 +6,10 @@
 static void
 ngx_http_zip_file_init(ngx_http_zip_file_t *parsing_file)
 {
-    parsing_file->uri.data = NULL;
-    parsing_file->uri.len = 0;
-
-    parsing_file->args.data = NULL;
-    parsing_file->args.len = 0;
-
-    parsing_file->filename.data = NULL;
-    parsing_file->filename.len = 0;
-    
-    parsing_file->filename_utf8.data = NULL;
-    parsing_file->filename_utf8.len = 0;
+    ngx_str_null(&parsing_file->uri);
+    ngx_str_null(&parsing_file->args);
+    ngx_str_null(&parsing_file->filename);
+    ngx_str_null(&parsing_file->filename_utf8);
 
     parsing_file->header_sent = 0;
     parsing_file->trailer_sent = 0;
@@ -29,33 +22,23 @@ ngx_http_zip_file_init(ngx_http_zip_file_t *parsing_file)
     parsing_file->need_zip64_offset = 0;
 }
 
-static char 
-hex_char_value(unsigned char ch) {
-    if ('0' <= ch && ch <= '9')
-	return ch - '0';
-    if ('A' <= ch && ch <= 'F')
-	return ch - 'A' + 10;
-    if ('a' <= ch && ch <= 'f')
-	return ch - 'A' + 10;
-    return 0;	
-}
-
-static size_t 
+static size_t
 destructive_url_decode_len(unsigned char* start, unsigned char* end)
 {
     unsigned char *read_pos = start, *write_pos = start;
-    
+
     for (; read_pos < end; read_pos++) {
-	unsigned char ch = *read_pos;
-	if (ch == '+')
-	    ch = ' ';
-	if (ch == '%' && (read_pos+2 < end)) {
-	    ch = 16 * hex_char_value(*(read_pos+1)) + hex_char_value(*(read_pos+2));
-	    read_pos += 2;
-	    }
-	*(write_pos++) = ch;
+        unsigned char ch = *read_pos;
+        if (ch == '+') {
+            ch = ' ';
+        }
+        if (ch == '%' && (read_pos + 2 < end)) {
+            ch = ngx_hextoi(read_pos + 1, 2);
+            read_pos += 2;
+        }
+        *(write_pos++) = ch;
     }
-    
+
     return write_pos - start;
 }
 
@@ -93,7 +76,7 @@ ngx_http_zip_clean_range(ngx_http_zip_range_t *range,
     write data noerror nofinal;
 }%%
 
-ngx_int_t 
+ngx_int_t
 ngx_http_zip_parse_request(ngx_http_zip_ctx_t *ctx)
 {
     int cs;
@@ -117,7 +100,7 @@ ngx_http_zip_parse_request(ngx_http_zip_ctx_t *ctx)
         }
 
         action end_uri {
-	    parsing_file->uri.len = destructive_url_decode_len(parsing_file->uri.data, fpc);
+            parsing_file->uri.len = destructive_url_decode_len(parsing_file->uri.data, fpc);
         }
         action start_args {
             parsing_file->args.data = fpc;
@@ -210,7 +193,7 @@ ngx_http_zip_parse_range(ngx_http_request_t *r, ngx_str_t *range_str, ngx_http_z
 
         suffix_byte_range_spec = "-" [0-9]+ $start_incr >suffix;
         byte_range_spec = [0-9]+ $start_incr
-                          "-" 
+                          "-"
                           [0-9]* $end_incr;
         byte_range_specs = ( byte_range_spec | suffix_byte_range_spec ) >new_range;
         byte_range_set = byte_range_specs ( "," byte_range_specs )*;

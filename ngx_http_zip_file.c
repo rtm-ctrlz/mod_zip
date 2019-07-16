@@ -8,7 +8,9 @@
 #include <iconv.h>
 #endif
 
+#ifdef NGX_ZIP_HAVE_ICONV
 static ngx_str_t ngx_http_zip_header_charset_name = ngx_string("upstream_http_x_archive_charset");
+#endif
 static ngx_str_t ngx_http_zip_header_name_separator = ngx_string("upstream_http_x_archive_name_sep");
 
 #define NGX_MAX_UINT16_VALUE 0xffff
@@ -248,13 +250,15 @@ ngx_http_zip_generate_pieces(ngx_http_request_t *r, ngx_http_zip_ctx_t *ctx)
     // Note: Currently it is impossible after '[PATCH] Support for UTF-8 file names.'(4f61592b)
     // because UFT-8 flag (zip_utf8_flag) is set default for templates.
 
-    if(ngx_http_upstream_header_variable(r, vv, (uintptr_t)(&ngx_http_zip_header_name_separator)) == NGX_OK && !vv->not_found) {
+    if (ngx_http_variable_unknown_header(vv, &ngx_http_zip_header_name_separator,
+                &r->upstream->headers_in.headers.part, sizeof("upstream_http_")-1) == NGX_OK && !vv->not_found) {
         ctx->native_charset = 1;
         if(vv->len)
             ctx->unicode_path = 1;
     } else {
 #ifdef NGX_ZIP_HAVE_ICONV
-        if (ngx_http_upstream_header_variable(r, vv, (uintptr_t)(&ngx_http_zip_header_charset_name)) == NGX_OK
+        if (ngx_http_variable_unknown_header(vv, &ngx_http_zip_header_charset_name,
+                    &r->upstream->headers_in.headers.part, sizeof("upstream_http_")-1) == NGX_OK
                 && !vv->not_found && ngx_strncmp(vv->data, "utf8", sizeof("utf8") - 1) != 0) {
 
             if(ngx_strncmp(vv->data, "native", sizeof("native") - 1))
@@ -327,8 +331,9 @@ ngx_http_zip_generate_pieces(ngx_http_request_t *r, ngx_http_zip_ctx_t *ctx)
 
                 file->filename_utf8_crc32 = ngx_crc32_long(file->filename_utf8.data, file->filename_utf8.len);
             }
+            else
 #endif
-              else if(vv->len) {
+              if(vv->len) {
                 const char * sep = ngx_http_zip_strnrstr((const char*)file->filename.data, file->filename.len,
                                                          (const char*)vv->data, vv->len);
                 if(sep) {
@@ -348,20 +353,30 @@ ngx_http_zip_generate_pieces(ngx_http_request_t *r, ngx_http_zip_ctx_t *ctx)
         if(file->size >= (off_t) NGX_MAX_UINT32_VALUE)
             ctx->zip64_used = file->need_zip64 = 1;
 
-        ctx->cd_size += sizeof(ngx_zip_central_directory_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_central_t)
-            + (file->need_zip64_offset ?
-                    (file->need_zip64 ? sizeof(ngx_zip_extra_field_zip64_sizes_offset_t) : sizeof(ngx_zip_extra_field_zip64_offset_only_t)) :
-                    (file->need_zip64 ? sizeof(ngx_zip_extra_field_zip64_sizes_only_t) : 0) +
-                    (ctx->unicode_path && file->filename_utf8.len ? (sizeof(ngx_zip_extra_field_unicode_path_t) + file->filename_utf8.len): 0)
-              );
+        ctx->cd_size += sizeof(ngx_zip_central_directory_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_central_t);
+        if (file->need_zip64) {
+            if (file->need_zip64_offset) {
+                ctx->cd_size += sizeof(ngx_zip_extra_field_zip64_sizes_offset_t);
+            } else {
+                ctx->cd_size += sizeof(ngx_zip_extra_field_zip64_sizes_only_t);
+            }
+        } else if (file->need_zip64_offset) {
+            ctx->cd_size += sizeof(ngx_zip_extra_field_zip64_offset_only_t);
+        }
+        if (ctx->unicode_path && file->filename_utf8.len)
+            ctx->cd_size += sizeof(ngx_zip_extra_field_unicode_path_t) + file->filename_utf8.len;
 
         header_piece = &ctx->pieces[piece_i++];
         header_piece->type = zip_header_piece;
         header_piece->file = file;
         header_piece->range.start = offset;
-        header_piece->range.end = offset += sizeof(ngx_zip_local_file_header_t)
-            + file->filename.len + sizeof(ngx_zip_extra_field_local_t) + (file->need_zip64? sizeof(ngx_zip_extra_field_zip64_sizes_only_t):0)
-            + (ctx->unicode_path && file->filename_utf8.len ? (sizeof(ngx_zip_extra_field_unicode_path_t) + file->filename_utf8.len): 0);
+
+        offset += sizeof(ngx_zip_local_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_local_t);
+        if (file->need_zip64)
+            offset += sizeof(ngx_zip_extra_field_zip64_sizes_only_t);
+        if (ctx->unicode_path && file->filename_utf8.len)
+            offset += sizeof(ngx_zip_extra_field_unicode_path_t) + file->filename_utf8.len;
+        header_piece->range.end = offset;
 
         file_piece = &ctx->pieces[piece_i++];
         file_piece->type = zip_file_piece;
@@ -412,6 +427,7 @@ ngx_http_zip_file_header_chain_link(ngx_http_request_t *r, ngx_http_zip_ctx_t *c
 {
     ngx_chain_t *link;
     ngx_buf_t   *b;
+    u_char      *p;
 
     ngx_http_zip_file_t *file = piece->file;
     ngx_zip_extra_field_local_t   extra_field_local;
@@ -419,9 +435,11 @@ ngx_http_zip_file_header_chain_link(ngx_http_request_t *r, ngx_http_zip_ctx_t *c
     ngx_zip_local_file_header_t   local_file_header;
     ngx_zip_extra_field_unicode_path_t extra_field_unicode_path;
 
-    size_t len = sizeof(ngx_zip_local_file_header_t) + file->filename.len
-        + sizeof(ngx_zip_extra_field_local_t) + (file->need_zip64? sizeof(ngx_zip_extra_field_zip64_sizes_only_t):0
-        + (ctx->unicode_path && file->filename_utf8.len ? (sizeof(ngx_zip_extra_field_unicode_path_t) + file->filename_utf8.len): 0));
+    size_t len = sizeof(ngx_zip_local_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_local_t);
+    if (file->need_zip64)
+        len += sizeof(ngx_zip_extra_field_zip64_sizes_only_t);
+    if (ctx->unicode_path && file->filename_utf8.len)
+        len += sizeof(ngx_zip_extra_field_unicode_path_t) + file->filename_utf8.len;
 
     if ((link = ngx_alloc_chain_link(r->pool)) == NULL || (b = ngx_calloc_buf(r->pool)) == NULL
             || (b->pos = ngx_pcalloc(r->pool, len)) == NULL)
@@ -429,6 +447,9 @@ ngx_http_zip_file_header_chain_link(ngx_http_request_t *r, ngx_http_zip_ctx_t *c
 
     b->memory = 1;
     b->last = b->pos + len;
+#if (NGX_HTTP_SSL)
+    b->flush = !!r->connection->ssl;
+#endif
 
     /* A note about the ZIP format: in order to appease all ZIP software I
      * could find, the local file header contains the file sizes but not the
@@ -451,7 +472,8 @@ ngx_http_zip_file_header_chain_link(ngx_http_request_t *r, ngx_http_zip_ctx_t *c
 
     if (file->need_zip64) {
         local_file_header.version = htole16(zip_version_zip64);
-        local_file_header.extra_field_len = sizeof(ngx_zip_extra_field_zip64_sizes_only_t) + sizeof(ngx_zip_extra_field_local_t);
+        local_file_header.extra_field_len += sizeof(ngx_zip_extra_field_zip64_sizes_only_t);
+
         extra_field_zip64.uncompressed_size = extra_field_zip64.compressed_size = htole64(file->size);
     } else {
         local_file_header.compressed_size = htole32(file->size);
@@ -480,21 +502,28 @@ ngx_http_zip_file_header_chain_link(ngx_http_request_t *r, ngx_http_zip_ctx_t *c
     extra_field_local.mtime = htole32(file->unix_time);
     extra_field_local.atime = htole32(file->unix_time);
 
-    ngx_memcpy(b->pos, &local_file_header, sizeof(ngx_zip_local_file_header_t));
-    ngx_memcpy(b->pos + sizeof(ngx_zip_local_file_header_t), file->filename.data, file->filename.len);
-    ngx_memcpy(b->pos + sizeof(ngx_zip_local_file_header_t) + file->filename.len,
-            &extra_field_local, sizeof(ngx_zip_extra_field_local_t));
-    if (file->need_zip64) {
-        ngx_memcpy(b->pos + sizeof(ngx_zip_local_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_local_t),
-                &extra_field_zip64, sizeof(ngx_zip_extra_field_zip64_sizes_only_t));
+    p = b->pos;
 
-        if (ctx->unicode_path && file->filename_utf8.len) {
-            ngx_memcpy(b->pos + sizeof(ngx_zip_local_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_local_t) + sizeof(ngx_zip_extra_field_zip64_sizes_only_t), &extra_field_unicode_path, sizeof(ngx_zip_extra_field_unicode_path_t));
-            ngx_memcpy(b->pos + sizeof(ngx_zip_local_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_local_t) + sizeof(ngx_zip_extra_field_zip64_sizes_only_t) + sizeof(ngx_zip_extra_field_unicode_path_t), file->filename_utf8.data, file->filename_utf8.len);
-        }
-    } else if (ctx->unicode_path && file->filename_utf8.len) {
-        ngx_memcpy(b->pos + sizeof(ngx_zip_local_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_local_t), &extra_field_unicode_path, sizeof(ngx_zip_extra_field_unicode_path_t));
-        ngx_memcpy(b->pos + sizeof(ngx_zip_local_file_header_t) + file->filename.len + sizeof(ngx_zip_extra_field_local_t) + sizeof(ngx_zip_extra_field_unicode_path_t), file->filename_utf8.data, file->filename_utf8.len);
+    ngx_memcpy(p, &local_file_header, sizeof(ngx_zip_local_file_header_t));
+    p += sizeof(ngx_zip_local_file_header_t);
+
+    ngx_memcpy(p, file->filename.data, file->filename.len);
+    p += file->filename.len;
+
+    ngx_memcpy(p, &extra_field_local, sizeof(ngx_zip_extra_field_local_t));
+    p += sizeof(ngx_zip_extra_field_local_t);
+
+    if (file->need_zip64) {
+        ngx_memcpy(p, &extra_field_zip64, sizeof(ngx_zip_extra_field_zip64_sizes_only_t));
+        p += sizeof(ngx_zip_extra_field_zip64_sizes_only_t);
+    }
+
+    if (ctx->unicode_path && file->filename_utf8.len) {
+        ngx_memcpy(p, &extra_field_unicode_path, sizeof(ngx_zip_extra_field_unicode_path_t));
+        p += sizeof(ngx_zip_extra_field_unicode_path_t);
+
+        ngx_memcpy(p, file->filename_utf8.data, file->filename_utf8.len);
+        p += file->filename_utf8.len;
     }
 
     ngx_http_zip_truncate_buffer(b, &piece->range, range);
@@ -679,15 +708,13 @@ ngx_http_zip_write_central_directory_entry(u_char *p, ngx_http_zip_file_t *file,
             extra_zip64_ptr = &extra_zip64_size;
             extra_zip64_ptr_size = sizeof(extra_zip64_size);
         }
-    } else {
-        if (file->need_zip64_offset){
-            extra_zip64_offset = ngx_zip_extra_field_zip64_offset_only_template;
-            extra_zip64_offset.tag = htole16(extra_zip64_offset.tag);
-            extra_zip64_offset.size = htole16(extra_zip64_offset.size);
-            extra_zip64_offset.relative_header_offset = htole64(file->offset);
-            extra_zip64_ptr = &extra_zip64_offset;
-            extra_zip64_ptr_size = sizeof(extra_zip64_offset);
-        }
+    } else if (file->need_zip64_offset) {
+        extra_zip64_offset = ngx_zip_extra_field_zip64_offset_only_template;
+        extra_zip64_offset.tag = htole16(extra_zip64_offset.tag);
+        extra_zip64_offset.size = htole16(extra_zip64_offset.size);
+        extra_zip64_offset.relative_header_offset = htole64(file->offset);
+        extra_zip64_ptr = &extra_zip64_offset;
+        extra_zip64_ptr_size = sizeof(extra_zip64_offset);
     }
     central_directory_file_header.extra_field_len=sizeof(ngx_zip_extra_field_central_t)+extra_zip64_ptr_size;
     extra_field_central = ngx_zip_extra_field_central_template;
